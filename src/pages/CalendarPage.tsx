@@ -150,5 +150,4 @@ const CalendarPage = () => {
   );
 };
 
-import React from "react";
 export default CalendarPage;
