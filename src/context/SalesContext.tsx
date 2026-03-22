@@ -1,4 +1,15 @@
-import React, { createContext, useContext, useState, useCallback, ReactNode } from "react";
+import React, { createContext, useContext, useState, useCallback, ReactNode, useEffect } from "react";
+import { 
+  generatePersonalizedEmail as generateBasicEmailAPI,
+  generatePersonalizedEmailWithResearch as generateEmailWithResearchAPI,
+  parseCSVFile,
+  generateLeadId,
+  saveLeadsToStorage,
+  loadLeadsFromStorage,
+  clearLeadsFromStorage,
+  downloadLeadsAsCSV as downloadLeadsAsCSVUtil,
+  StoredLead,
+} from "@/lib/api-clients";
 
 type LeadSource = "CSV" | "Script" | "Integration";
 
@@ -62,9 +73,13 @@ interface SalesContextType {
 
   importLeads: () => void;
   importLeadsFromCsv: () => number;
+  importLeadsFromCSVFile: (file: File) => Promise<number>;
   scrapeLeadsFromScript: () => number;
   importLeadsFromIntegration: () => number;
+  addLeadFromScrap: (lead: { name: string; email: string; company: string; role: string }) => void;
   enrichLeads: () => Promise<void>;
+  clearAllLeads: () => void;
+  downloadLeadsAsCSV: () => void;
   addCampaign: (name: string, leadIds: number[]) => number;
   launchCampaign: (id: number) => void;
   generatePersonalizedEmailForLead: (params: {
@@ -72,7 +87,12 @@ interface SalesContextType {
     tone: string;
     goal: string;
     extraContext?: string;
-  }) => { subject: string; email: string } | null;
+  }) => Promise<{ subject: string; email: string } | null>;
+  generatePersonalizedEmailWithResearch: (params: {
+    leadId: number;
+    tone: string;
+    goal: string;
+  }) => Promise<{ subject: string; email: string; hook: string } | null>;
   simulateReply: () => void;
   markConverted: (threadId: number) => void;
   connectCalendar: () => Promise<void>;
@@ -125,6 +145,13 @@ const SIMULATED_REPLIES = [
 
 let replyCounter = 0;
 
+let lastGeneratedNumericId = 0;
+const nextNumericId = (): number => {
+  const now = Date.now();
+  lastGeneratedNumericId = now > lastGeneratedNumericId ? now : lastGeneratedNumericId + 1;
+  return lastGeneratedNumericId;
+};
+
 export const SalesProvider = ({ children }: { children: ReactNode }) => {
   const [leads, setLeads] = useState<Lead[]>([]);
   const [campaigns, setCampaigns] = useState<Campaign[]>([]);
@@ -139,9 +166,52 @@ export const SalesProvider = ({ children }: { children: ReactNode }) => {
     meetingsBooked: 0,
   });
 
+  // Load leads from localStorage on mount
+  useEffect(() => {
+    const stored = loadLeadsFromStorage();
+    if (stored.length > 0) {
+      const seenEmails = new Set<string>();
+      const convertedLeads: Lead[] = stored
+        .filter((sl) => {
+          const email = sl.email.toLowerCase();
+          if (seenEmails.has(email)) return false;
+          seenEmails.add(email);
+          return true;
+        })
+        .map((sl) => ({
+          id: nextNumericId(),
+          name: sl.name,
+          email: sl.email,
+          company: sl.company,
+          role: sl.role,
+          source: sl.source === "csv" ? "CSV" : sl.source === "scraped" ? "Script" : "Integration",
+          status: "New",
+          lastContacted: "Never",
+        }));
+      setLeads(convertedLeads);
+      setMetrics((m) => ({ ...m, totalLeads: convertedLeads.length }));
+    }
+  }, []);
+
+  // Save leads to localStorage whenever they change
+  useEffect(() => {
+    const storedLeads: StoredLead[] = leads.map((lead) => ({
+      id: generateLeadId(),
+      name: lead.name,
+      email: lead.email,
+      company: lead.company,
+      role: lead.role,
+      source: lead.source === "CSV" ? "csv" : lead.source === "Script" ? "scraped" : "integration",
+      importedAt: Date.now(),
+    }));
+    if (storedLeads.length > 0) {
+      saveLeadsToStorage(storedLeads);
+    }
+  }, [leads]);
+
   const addActivity = useCallback((text: string, type: ActivityEvent["type"]) => {
     setActivityFeed((prev) => [
-      { id: Date.now() + Math.random(), text, type, time: "Just now" },
+      { id: nextNumericId(), text, type, time: "Just now" },
       ...prev,
     ].slice(0, 20));
   }, []);
@@ -186,6 +256,87 @@ export const SalesProvider = ({ children }: { children: ReactNode }) => {
     return added;
   }, [addActivity, appendLeads]);
 
+  const importLeadsFromCSVFile = useCallback(async (file: File): Promise<number> => {
+    try {
+      const parsedLeads = await parseCSVFile(file);
+      const convertedLeads: Omit<Lead, "source">[] = parsedLeads.map((lead) => ({
+        id: nextNumericId(),
+        name: lead.name,
+        email: lead.email,
+        company: lead.company,
+        role: lead.role,
+        status: "New",
+        lastContacted: "Never",
+      }));
+
+      const existing = new Set(leads.map((l) => l.id));
+      const newLeads = convertedLeads
+        .filter((l) => !existing.has(l.id) && !leads.some((existing) => existing.email === l.email))
+        .map((l) => ({ ...l, source: "CSV" as const }));
+
+      if (newLeads.length === 0) {
+        return 0;
+      }
+
+      setLeads((prev) => [...prev, ...newLeads]);
+      setMetrics((m) => ({ ...m, totalLeads: m.totalLeads + newLeads.length }));
+      addActivity(`Imported ${newLeads.length} leads from CSV file`, "send");
+
+      return newLeads.length;
+    } catch (error) {
+      console.error("CSV import failed:", error);
+      throw error;
+    }
+  }, [leads, addActivity]);
+
+  const clearAllLeads = useCallback(() => {
+    setLeads([]);
+    setMetrics((m) => ({ ...m, totalLeads: 0 }));
+    clearLeadsFromStorage();
+    addActivity("All leads cleared from storage", "send");
+  }, [addActivity]);
+
+  const downloadLeadsAsCSV = useCallback(() => {
+    const storedLeads: StoredLead[] = leads.map((lead) => ({
+      id: generateLeadId(),
+      name: lead.name,
+      email: lead.email,
+      company: lead.company,
+      role: lead.role,
+      source: lead.source === "CSV" ? "csv" : lead.source === "Script" ? "scraped" : "integration",
+      importedAt: Date.now(),
+    }));
+
+    if (storedLeads.length === 0) {
+      return;
+    }
+
+    const filename = `leads-${new Date().toISOString().split("T")[0]}.csv`;
+    downloadLeadsAsCSVUtil(storedLeads, filename);
+    addActivity(`Downloaded ${storedLeads.length} leads as CSV`, "send");
+  }, [leads, addActivity]);
+
+  const addLeadFromScrap = useCallback((scrapedLead: { name: string; email: string; company: string; role: string }) => {
+    const newLead: Lead = {
+      id: nextNumericId(),
+      name: scrapedLead.name,
+      email: scrapedLead.email,
+      company: scrapedLead.company,
+      role: scrapedLead.role,
+      source: "Script",
+      status: "New",
+      lastContacted: "Never",
+    };
+
+    // Check if lead already exists
+    if (leads.some((l) => l.email === newLead.email)) {
+      return;
+    }
+
+    setLeads((prev) => [...prev, newLead]);
+    setMetrics((m) => ({ ...m, totalLeads: m.totalLeads + 1 }));
+  }, [leads]);
+
   const importLeads = useCallback(() => importLeadsFromCsv(), [importLeadsFromCsv]);
 
   const enrichLeads = useCallback(async () => {
@@ -202,7 +353,7 @@ export const SalesProvider = ({ children }: { children: ReactNode }) => {
 
   const addCampaign = useCallback((name: string, leadIds: number[]) => {
     const c: Campaign = {
-      id: Date.now(),
+      id: nextNumericId(),
       name,
       status: "Draft",
       leads: leadIds.length,
@@ -214,7 +365,7 @@ export const SalesProvider = ({ children }: { children: ReactNode }) => {
     return c.id;
   }, []);
 
-  const generatePersonalizedEmailForLead = useCallback((params: {
+  const generatePersonalizedEmailForLead = useCallback(async (params: {
     leadId: number;
     tone: string;
     goal: string;
@@ -223,27 +374,98 @@ export const SalesProvider = ({ children }: { children: ReactNode }) => {
     const target = leads.find((lead) => lead.id === params.leadId);
     if (!target) return null;
 
-    const aiLine = target.aiLine || `Noticed the work ${target.company} is doing around modern revenue execution.`;
-    const subject = `${target.company}: ${params.goal} with ${params.tone.toLowerCase()} outreach`;
-    const email = `Hi ${target.name.split(" ")[0]},\n\n${aiLine}\n\nI wanted to reach out because teams like ${target.company} are using AI-assisted outreach to improve reply rates while keeping messaging personal.\n\nGoal: ${params.goal}. Tone: ${params.tone}.\n${params.extraContext ? `Context to include: ${params.extraContext}\n` : ""}\nWould you be open to a quick 15-minute conversation this week?\n\nBest,\nAlex`;
+    try {
+      const generated = await generateBasicEmailAPI(
+        target.name,
+        target.company,
+        target.role,
+        `${params.goal}. Tone: ${params.tone}${params.extraContext ? `. Extra context: ${params.extraContext}` : ""}`
+      );
 
-    setLeads((prev) =>
-      prev.map((lead) =>
-        lead.id === params.leadId
-          ? {
-              ...lead,
-              aiLine,
-              personalizedSubject: subject,
-              personalizedEmail: email,
-              status: lead.status === "New" ? "Enriched" : lead.status,
-            }
-          : lead
-      )
-    );
+      const email = `Hi ${target.name.split(" ")[0]},\n\n${generated.opening}\n\n${generated.body}`;
 
-    addActivity(`Generated personalized email for ${target.name}`, "enriched");
+      setLeads((prev) =>
+        prev.map((lead) =>
+          lead.id === params.leadId
+            ? {
+                ...lead,
+                aiLine: generated.opening,
+                personalizedSubject: generated.subject,
+                personalizedEmail: email,
+                status: lead.status === "New" ? "Enriched" : lead.status,
+              }
+            : lead
+        )
+      );
 
-    return { subject, email };
+      addActivity(`Generated LLM email for ${target.name}`, "enriched");
+
+      return { subject: generated.subject, email };
+    } catch (error) {
+      // Keep a reliable fallback if LLM fails.
+      const aiLine = target.aiLine || `Noticed the work ${target.company} is doing around modern revenue execution.`;
+      const subject = `${target.company}: ${params.goal} with ${params.tone.toLowerCase()} outreach`;
+      const email = `Hi ${target.name.split(" ")[0]},\n\n${aiLine}\n\nI wanted to reach out because teams like ${target.company} are using AI-assisted outreach to improve reply rates while keeping messaging personal.\n\nGoal: ${params.goal}. Tone: ${params.tone}.\n${params.extraContext ? `Context to include: ${params.extraContext}\n` : ""}\nWould you be open to a quick 15-minute conversation this week?\n\nBest,\nAlex`;
+
+      setLeads((prev) =>
+        prev.map((lead) =>
+          lead.id === params.leadId
+            ? {
+                ...lead,
+                aiLine,
+                personalizedSubject: subject,
+                personalizedEmail: email,
+                status: lead.status === "New" ? "Enriched" : lead.status,
+              }
+            : lead
+        )
+      );
+
+      addActivity(`Generated fallback email for ${target.name}`, "enriched");
+
+      return { subject, email };
+    }
+  }, [addActivity, leads]);
+
+  const generatePersonalizedEmailWithResearch = useCallback(async (params: {
+    leadId: number;
+    tone: string;
+    goal: string;
+  }) => {
+    const target = leads.find((lead) => lead.id === params.leadId);
+    if (!target) return null;
+
+    try {
+      const result = await generateEmailWithResearchAPI(
+        target.name,
+        target.company,
+        target.role,
+        params.tone,
+        params.goal
+      );
+
+      setLeads((prev) =>
+        prev.map((lead) =>
+          lead.id === params.leadId
+            ? {
+                ...lead,
+                personalizedSubject: result.subject,
+                personalizedEmail: result.body,
+                aiLine: result.hook,
+                status: lead.status === "New" ? "Enriched" : lead.status,
+              }
+            : lead
+        )
+      );
+
+      addActivity(`Generated AI-researched email for ${target.name} at ${target.company}`, "enriched");
+
+      return { subject: result.subject, email: result.body, hook: result.hook };
+    } catch (error) {
+      console.error("Failed to generate email with research:", error);
+      addActivity(`Failed to generate email for ${target.name}`, "enriched");
+      return null;
+    }
   }, [addActivity, leads]);
 
   const launchCampaign = useCallback((id: number) => {
@@ -283,7 +505,7 @@ export const SalesProvider = ({ children }: { children: ReactNode }) => {
     const template = SIMULATED_REPLIES[replyCounter % SIMULATED_REPLIES.length];
     replyCounter++;
     const newThread: InboxThread = {
-      id: Date.now(),
+      id: nextNumericId(),
       ...template,
       time: "Just now",
       unread: true,
@@ -336,8 +558,8 @@ export const SalesProvider = ({ children }: { children: ReactNode }) => {
       value={{
         leads, campaigns, inbox, metrics, activityFeed,
         calendarConnected, autoBook,
-        importLeads, importLeadsFromCsv, scrapeLeadsFromScript, importLeadsFromIntegration,
-        enrichLeads, addCampaign, launchCampaign, generatePersonalizedEmailForLead,
+        importLeads, importLeadsFromCsv, importLeadsFromCSVFile, scrapeLeadsFromScript, importLeadsFromIntegration, addLeadFromScrap,
+        enrichLeads, clearAllLeads, downloadLeadsAsCSV, addCampaign, launchCampaign, generatePersonalizedEmailForLead, generatePersonalizedEmailWithResearch,
         simulateReply, markConverted, connectCalendar, setAutoBook, addActivity,
       }}
     >
