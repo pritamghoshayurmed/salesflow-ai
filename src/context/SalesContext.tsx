@@ -1,14 +1,19 @@
 import React, { createContext, useContext, useState, useCallback, ReactNode } from "react";
 
+type LeadSource = "CSV" | "Script" | "Integration";
+
 export interface Lead {
   id: number;
   name: string;
   email: string;
   company: string;
   role: string;
+  source: LeadSource;
   status: string;
   lastContacted: string;
   aiLine?: string;
+  personalizedSubject?: string;
+  personalizedEmail?: string;
 }
 
 export interface Campaign {
@@ -16,6 +21,7 @@ export interface Campaign {
   name: string;
   status: string;
   leads: number;
+  selectedLeadIds: number[];
   replyRate: string;
   openRate: string;
 }
@@ -55,9 +61,18 @@ interface SalesContextType {
   autoBook: boolean;
 
   importLeads: () => void;
+  importLeadsFromCsv: () => number;
+  scrapeLeadsFromScript: () => number;
+  importLeadsFromIntegration: () => number;
   enrichLeads: () => Promise<void>;
-  addCampaign: (name: string, leadCount: number) => void;
+  addCampaign: (name: string, leadIds: number[]) => number;
   launchCampaign: (id: number) => void;
+  generatePersonalizedEmailForLead: (params: {
+    leadId: number;
+    tone: string;
+    goal: string;
+    extraContext?: string;
+  }) => { subject: string; email: string } | null;
   simulateReply: () => void;
   markConverted: (threadId: number) => void;
   connectCalendar: () => Promise<void>;
@@ -73,12 +88,24 @@ export const useSales = () => {
   return ctx;
 };
 
-const MOCK_CSV_LEADS: Lead[] = [
+const MOCK_CSV_LEADS: Omit<Lead, "source">[] = [
   { id: 101, name: "Rachel Torres", email: "rachel@snowflake.com", company: "Snowflake", role: "VP Revenue", status: "New", lastContacted: "Never" },
   { id: 102, name: "Kevin Huang", email: "kevin@datadog.com", company: "Datadog", role: "Head of Sales", status: "New", lastContacted: "Never" },
   { id: 103, name: "Priya Sharma", email: "priya@freshworks.com", company: "Freshworks", role: "Director BDR", status: "New", lastContacted: "Never" },
   { id: 104, name: "Tom Baker", email: "tom@cloudflare.com", company: "Cloudflare", role: "CRO", status: "New", lastContacted: "Never" },
   { id: 105, name: "Mei Lin", email: "mei@retool.com", company: "Retool", role: "GTM Lead", status: "New", lastContacted: "Never" },
+];
+
+const MOCK_SCRIPT_LEADS: Omit<Lead, "source">[] = [
+  { id: 201, name: "Daniel Park", email: "daniel@atlassian.com", company: "Atlassian", role: "Sales Operations Lead", status: "New", lastContacted: "Never" },
+  { id: 202, name: "Sofia Rossi", email: "sofia@canva.com", company: "Canva", role: "Head of Growth", status: "New", lastContacted: "Never" },
+  { id: 203, name: "Marcus Lee", email: "marcus@notion.so", company: "Notion", role: "Director of Revenue", status: "New", lastContacted: "Never" },
+];
+
+const MOCK_INTEGRATION_LEADS: Omit<Lead, "source">[] = [
+  { id: 301, name: "Nadia Ahmed", email: "nadia@hubspot.com", company: "HubSpot", role: "Regional Sales Manager", status: "New", lastContacted: "Never" },
+  { id: 302, name: "Oliver Grant", email: "oliver@salesforce.com", company: "Salesforce", role: "Enterprise AE", status: "New", lastContacted: "Never" },
+  { id: 303, name: "Elena Diaz", email: "elena@zendesk.com", company: "Zendesk", role: "RevOps Manager", status: "New", lastContacted: "Never" },
 ];
 
 const AI_LINES: Record<number, string> = {
@@ -119,15 +146,47 @@ export const SalesProvider = ({ children }: { children: ReactNode }) => {
     ].slice(0, 20));
   }, []);
 
-  const importLeads = useCallback(() => {
-    setLeads((prev) => {
-      const existing = new Set(prev.map((l) => l.id));
-      const newLeads = MOCK_CSV_LEADS.filter((l) => !existing.has(l.id));
-      return [...prev, ...newLeads];
-    });
-    setMetrics((m) => ({ ...m, totalLeads: m.totalLeads + MOCK_CSV_LEADS.length }));
-    addActivity("Imported 5 leads from CSV upload", "send");
-  }, [addActivity]);
+  const appendLeads = useCallback((incoming: Omit<Lead, "source">[], source: LeadSource) => {
+    const existing = new Set(leads.map((l) => l.id));
+    const newLeads = incoming
+      .filter((l) => !existing.has(l.id))
+      .map((l) => ({ ...l, source }));
+
+    if (newLeads.length === 0) {
+      return 0;
+    }
+
+    setLeads((prev) => [...prev, ...newLeads]);
+    setMetrics((m) => ({ ...m, totalLeads: m.totalLeads + newLeads.length }));
+
+    return newLeads.length;
+  }, [leads]);
+
+  const importLeadsFromCsv = useCallback(() => {
+    const added = appendLeads(MOCK_CSV_LEADS, "CSV");
+    if (added > 0) {
+      addActivity(`Imported ${added} leads from CSV upload`, "send");
+    }
+    return added;
+  }, [addActivity, appendLeads]);
+
+  const scrapeLeadsFromScript = useCallback(() => {
+    const added = appendLeads(MOCK_SCRIPT_LEADS, "Script");
+    if (added > 0) {
+      addActivity(`Scraped ${added} leads from web script`, "send");
+    }
+    return added;
+  }, [addActivity, appendLeads]);
+
+  const importLeadsFromIntegration = useCallback(() => {
+    const added = appendLeads(MOCK_INTEGRATION_LEADS, "Integration");
+    if (added > 0) {
+      addActivity(`Imported ${added} leads from CRM integration`, "send");
+    }
+    return added;
+  }, [addActivity, appendLeads]);
+
+  const importLeads = useCallback(() => importLeadsFromCsv(), [importLeadsFromCsv]);
 
   const enrichLeads = useCallback(async () => {
     await new Promise((r) => setTimeout(r, 2000));
@@ -141,31 +200,84 @@ export const SalesProvider = ({ children }: { children: ReactNode }) => {
     addActivity("AI enriched all leads with personalized opening lines", "enriched");
   }, [addActivity]);
 
-  const addCampaign = useCallback((name: string, leadCount: number) => {
+  const addCampaign = useCallback((name: string, leadIds: number[]) => {
     const c: Campaign = {
       id: Date.now(),
       name,
       status: "Draft",
-      leads: leadCount,
+      leads: leadIds.length,
+      selectedLeadIds: leadIds,
       replyRate: "0%",
       openRate: "0%",
     };
     setCampaigns((prev) => [...prev, c]);
+    return c.id;
   }, []);
 
+  const generatePersonalizedEmailForLead = useCallback((params: {
+    leadId: number;
+    tone: string;
+    goal: string;
+    extraContext?: string;
+  }) => {
+    const target = leads.find((lead) => lead.id === params.leadId);
+    if (!target) return null;
+
+    const aiLine = target.aiLine || `Noticed the work ${target.company} is doing around modern revenue execution.`;
+    const subject = `${target.company}: ${params.goal} with ${params.tone.toLowerCase()} outreach`;
+    const email = `Hi ${target.name.split(" ")[0]},\n\n${aiLine}\n\nI wanted to reach out because teams like ${target.company} are using AI-assisted outreach to improve reply rates while keeping messaging personal.\n\nGoal: ${params.goal}. Tone: ${params.tone}.\n${params.extraContext ? `Context to include: ${params.extraContext}\n` : ""}\nWould you be open to a quick 15-minute conversation this week?\n\nBest,\nAlex`;
+
+    setLeads((prev) =>
+      prev.map((lead) =>
+        lead.id === params.leadId
+          ? {
+              ...lead,
+              aiLine,
+              personalizedSubject: subject,
+              personalizedEmail: email,
+              status: lead.status === "New" ? "Enriched" : lead.status,
+            }
+          : lead
+      )
+    );
+
+    addActivity(`Generated personalized email for ${target.name}`, "enriched");
+
+    return { subject, email };
+  }, [addActivity, leads]);
+
   const launchCampaign = useCallback((id: number) => {
+    const campaign = campaigns.find((c) => c.id === id);
+    if (!campaign) return;
+
+    const selectedIds = new Set(campaign.selectedLeadIds);
+    const selectedCount = campaign.selectedLeadIds.length;
+
     setCampaigns((prev) =>
       prev.map((c) => (c.id === id ? { ...c, status: "Active", openRate: "64%", replyRate: "0%" } : c))
     );
-    setLeads((prev) => prev.map((l) => ({ ...l, status: "In Sequence" })));
-    setMetrics((m) => ({ ...m, emailsSent: m.emailsSent + 5 }));
-    addActivity("Campaign launched — emails are being sent", "campaign");
+
+    setLeads((prev) =>
+      prev.map((l) =>
+        selectedIds.has(l.id)
+          ? {
+              ...l,
+              status: "In Sequence",
+              lastContacted: "Just now",
+            }
+          : l
+      )
+    );
+
+    setMetrics((m) => ({ ...m, emailsSent: m.emailsSent + selectedCount }));
+    addActivity(`Campaign launched — ${selectedCount} personalized emails are being sent`, "campaign");
+
     // Simulate open rate bump
     setTimeout(() => {
-      setMetrics((m) => ({ ...m, emailsSent: m.emailsSent + 3 }));
-      addActivity("3 emails opened by prospects", "send");
+      const opened = Math.max(1, Math.round(selectedCount * 0.4));
+      addActivity(`${opened} emails opened by prospects`, "send");
     }, 3000);
-  }, [addActivity]);
+  }, [addActivity, campaigns]);
 
   const simulateReply = useCallback(() => {
     const template = SIMULATED_REPLIES[replyCounter % SIMULATED_REPLIES.length];
@@ -224,7 +336,8 @@ export const SalesProvider = ({ children }: { children: ReactNode }) => {
       value={{
         leads, campaigns, inbox, metrics, activityFeed,
         calendarConnected, autoBook,
-        importLeads, enrichLeads, addCampaign, launchCampaign,
+        importLeads, importLeadsFromCsv, scrapeLeadsFromScript, importLeadsFromIntegration,
+        enrichLeads, addCampaign, launchCampaign, generatePersonalizedEmailForLead,
         simulateReply, markConverted, connectCalendar, setAutoBook, addActivity,
       }}
     >

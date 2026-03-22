@@ -1,7 +1,7 @@
 import { useState, useCallback } from "react";
 import TopNavbar from "@/components/TopNavbar";
 import { useSales } from "@/context/SalesContext";
-import { Upload, Sparkles, X, Mail, Building, Briefcase, Clock, FileUp, Users } from "lucide-react";
+import { Upload, Sparkles, X, Mail, Building, Briefcase, Clock, FileUp, Users, Zap, Plug } from "lucide-react";
 import { toast } from "sonner";
 
 const statusBadge = (status: string) => {
@@ -19,27 +19,37 @@ const statusBadge = (status: string) => {
 const initials = (name: string) => name.split(" ").map((n) => n[0]).join("");
 
 const Leads = () => {
-  const { leads, importLeads, enrichLeads } = useSales();
+  const { leads, importLeadsFromCsv, scrapeLeadsFromScript, importLeadsFromIntegration } = useSales();
   const [selectedLead, setSelectedLead] = useState<typeof leads[0] | null>(null);
-  const [enriching, setEnriching] = useState(false);
   const [showUpload, setShowUpload] = useState(false);
 
   const handleImport = useCallback(() => {
-    importLeads();
+    const added = importLeadsFromCsv();
     setShowUpload(false);
-    toast.success("5 leads imported from CSV!");
-  }, [importLeads]);
-
-  const handleEnrich = useCallback(async () => {
-    if (leads.length === 0) {
-      toast.error("Import leads first before enriching.");
+    if (added > 0) {
+      toast.success(`${added} leads imported from CSV!`);
       return;
     }
-    setEnriching(true);
-    await enrichLeads();
-    setEnriching(false);
-    toast.success("AI personalization lines generated!");
-  }, [leads.length, enrichLeads]);
+    toast.info("All CSV leads are already imported.");
+  }, [importLeadsFromCsv]);
+
+  const handleScrapeLeads = useCallback(() => {
+    const added = scrapeLeadsFromScript();
+    if (added > 0) {
+      toast.success(`${added} leads scraped from script.`);
+      return;
+    }
+    toast.info("No new leads found from script source.");
+  }, [scrapeLeadsFromScript]);
+
+  const handleFindLeadsFromIntegration = useCallback(() => {
+    const added = importLeadsFromIntegration();
+    if (added > 0) {
+      toast.success(`${added} leads imported from integration.`);
+      return;
+    }
+    toast.info("No new leads found from integration.");
+  }, [importLeadsFromIntegration]);
 
   return (
     <>
@@ -55,12 +65,18 @@ const Leads = () => {
               <Upload className="w-4 h-4" /> Upload CSV
             </button>
             <button
-              onClick={handleEnrich}
-              disabled={enriching || leads.length === 0}
-              className="flex items-center gap-2 px-4 py-2 rounded-xl bg-primary text-primary-foreground text-sm font-medium hover:opacity-90 transition-opacity disabled:opacity-50"
+              onClick={handleScrapeLeads}
+              className="flex items-center gap-2 px-4 py-2 rounded-xl bg-primary text-primary-foreground text-sm font-medium hover:opacity-90 transition-opacity"
             >
-              <Sparkles className="w-4 h-4" />
-              {enriching ? "Enriching..." : "Enrich & Generate AI Lines"}
+              <Zap className="w-4 h-4" />
+              Scrape Leads
+            </button>
+            <button
+              onClick={handleFindLeadsFromIntegration}
+              className="flex items-center gap-2 px-4 py-2 rounded-xl bg-primary text-primary-foreground text-sm font-medium hover:opacity-90 transition-opacity"
+            >
+              <Plug className="w-4 h-4" />
+              Find Leads from Integration
             </button>
           </div>
 
@@ -110,6 +126,7 @@ const Leads = () => {
                     <th className="text-left text-xs font-medium text-muted-foreground px-4 py-3 hidden md:table-cell">Email</th>
                     <th className="text-left text-xs font-medium text-muted-foreground px-4 py-3 hidden lg:table-cell">Company</th>
                     <th className="text-left text-xs font-medium text-muted-foreground px-4 py-3 hidden lg:table-cell">Role</th>
+                    <th className="text-left text-xs font-medium text-muted-foreground px-4 py-3 hidden xl:table-cell">Source</th>
                     <th className="text-left text-xs font-medium text-muted-foreground px-4 py-3">Status</th>
                     {leads.some((l) => l.aiLine) && (
                       <th className="text-left text-xs font-medium text-muted-foreground px-4 py-3 hidden xl:table-cell">AI Line</th>
@@ -134,12 +151,11 @@ const Leads = () => {
                       <td className="px-4 py-3 text-sm text-muted-foreground hidden md:table-cell">{lead.email}</td>
                       <td className="px-4 py-3 text-sm text-foreground hidden lg:table-cell">{lead.company}</td>
                       <td className="px-4 py-3 text-sm text-muted-foreground hidden lg:table-cell">{lead.role}</td>
+                      <td className="px-4 py-3 hidden xl:table-cell"><span className="badge-neutral">{lead.source}</span></td>
                       <td className="px-4 py-3"><span className={statusBadge(lead.status)}>{lead.status}</span></td>
                       {leads.some((l) => l.aiLine) && (
                         <td className="px-4 py-3 hidden xl:table-cell">
-                          {enriching ? (
-                            <div className="h-4 w-48 rounded bg-muted animate-pulse" />
-                          ) : lead.aiLine ? (
+                          {lead.aiLine ? (
                             <span className="text-xs text-muted-foreground italic truncate block max-w-[240px]">"{lead.aiLine}"</span>
                           ) : (
                             <span className="text-xs text-muted-foreground">—</span>
@@ -188,6 +204,10 @@ const Leads = () => {
               <div className="flex items-center gap-3 p-3 rounded-xl bg-muted/50">
                 <Clock className="w-4 h-4 text-muted-foreground" />
                 <span className="text-sm text-foreground">{selectedLead.lastContacted}</span>
+              </div>
+              <div className="flex items-center gap-3 p-3 rounded-xl bg-muted/50">
+                <Users className="w-4 h-4 text-muted-foreground" />
+                <span className="text-sm text-foreground">Source: {selectedLead.source}</span>
               </div>
             </div>
 
