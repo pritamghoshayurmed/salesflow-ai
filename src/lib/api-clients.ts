@@ -1,11 +1,11 @@
 /**
  * API Client utilities for:
  * - Resend (Email sending)
- * - OpenRouter (LLM for personalization & lead scraping)
+ * - Groq (LLM for personalization & lead scraping)
  * - SerpAPI (Web search for lead discovery)
  */
 
-import { OpenRouter } from "@openrouter/sdk";
+import Groq from "groq-sdk";
 
 // ============= RESEND EMAIL CLIENT =============
 interface ResendEmailParams {
@@ -25,12 +25,7 @@ export const sendEmailViaResend = async (params: ResendEmailParams) => {
         Authorization: `Bearer ${import.meta.env.VITE_RESEND_API_KEY}`,
         "Content-Type": "application/json",
       },
-      body: JSON.stringify({
-        from,
-        to,
-        subject,
-        html,
-      }),
+      body: JSON.stringify({ from, to, subject, html }),
     });
 
     if (!response.ok) {
@@ -44,199 +39,88 @@ export const sendEmailViaResend = async (params: ResendEmailParams) => {
   }
 };
 
-// ============= OPENROUTER LLM CLIENT =============
-interface OpenRouterMessage {
-  role: "user" | "assistant" | "system";
-  content: string;
-}
+// ============= GROQ LLM CLIENT =============
 
-interface OpenRouterAgent {
-  send: (message: string, maxTokens?: number) => Promise<string>;
-  getHistory: () => OpenRouterMessage[];
-  clearHistory: () => void;
-}
+const GROQ_MODEL = "compound-beta";
 
-const OPENROUTER_MODEL = "nvidia/nemotron-3-super-120b-a12b:free";
-const OPENROUTER_FALLBACK_MODEL =
-  import.meta.env.VITE_OPENROUTER_FALLBACK_MODEL || "openrouter/auto";
+let cachedGroqClient: Groq | null = null;
 
-const OPENROUTER_GUARDRAIL_ERROR_SNIPPET =
-  "No endpoints available matching your guardrail restrictions and data policy";
+const getGroqClient = (): Groq => {
+  if (cachedGroqClient) return cachedGroqClient;
 
-let cachedOpenRouterClient: OpenRouter | null = null;
-
-const getOpenRouterClient = (): OpenRouter => {
-  if (cachedOpenRouterClient) {
-    return cachedOpenRouterClient;
-  }
-
-  const apiKey = import.meta.env.VITE_OPENROUTER_API_KEY;
+  const apiKey = import.meta.env.VITE_GROQ_API_KEY;
   if (!apiKey) {
     throw new Error(
-      "OpenRouter API key is missing. Set VITE_OPENROUTER_API_KEY in your .env file"
+      "Groq API key is missing. Add VITE_GROQ_API_KEY to your .env file."
     );
   }
 
-  const clientOptions: {
-    apiKey: string;
-    httpReferer?: string;
-    xTitle?: string;
-  } = { apiKey };
-  const siteUrl =
-    import.meta.env.VITE_OPENROUTER_SITE_URL ||
-    (typeof window !== "undefined" ? window.location.origin : "");
-  const siteTitle = import.meta.env.VITE_OPENROUTER_SITE_NAME || "Salesflow AI";
-
-  if (siteUrl) {
-    clientOptions.httpReferer = siteUrl;
-  }
-  if (siteTitle) {
-    clientOptions.xTitle = siteTitle;
-  }
-
-  cachedOpenRouterClient = new OpenRouter(clientOptions);
-
-  return cachedOpenRouterClient;
+  // dangerouslyAllowBrowser is required when running in a Vite/browser context
+  cachedGroqClient = new Groq({ apiKey, dangerouslyAllowBrowser: true });
+  return cachedGroqClient;
 };
 
-export const callOpenRouterLLM = async (
-  messages: OpenRouterMessage[],
+type ChatMessage = { role: "user" | "assistant" | "system"; content: string };
+
+/**
+ * Call Groq with an array of chat messages and return the text response.
+ * Drop-in replacement for the previous callOpenRouterLLM / callGeminiLLM calls.
+ */
+export const callGroqLLM = async (
+  messages: ChatMessage[],
   maxTokens = 4000
-) => {
-  const isGuardrailError = (err: unknown): boolean => {
-    const text = err instanceof Error ? err.message : String(err);
-    return text.includes(OPENROUTER_GUARDRAIL_ERROR_SNIPPET);
-  };
-
-  const sendChat = async (model: string, useProviderOverride = false) => {
-    const openRouter = getOpenRouterClient();
-
-    return openRouter.chat.send({
-      chatGenerationParams: {
-        model,
-        messages,
-        maxTokens: Math.max(maxTokens, 4000),
-        temperature: 0.7,
-        stream: false,
-        provider: useProviderOverride
-          ? {
-              allowFallbacks: true,
-              dataCollection: "allow",
-              zdr: false,
-            }
-          : undefined,
-      },
-    });
-  };
-
-  const extractTextContent = (content: unknown): string => {
-    if (typeof content === "string") {
-      return content;
-    }
-
-    if (!Array.isArray(content)) {
-      return "";
-    }
-
-    return content
-      .map((item: any) => {
-        if (!item || typeof item !== "object") return "";
-        return item.type === "text" || item.type === "output_text"
-          ? item.text || ""
-          : "";
-      })
-      .join("\n");
-  };
-
-  const getMessageOutput = (message: any): string => {
-    if (!message) return "";
-
-    if (message.content && typeof message.content === "string") {
-      return message.content;
-    }
-
-    if (message.content) {
-      return extractTextContent(message.content);
-    }
-
-    return "";
-  };
+): Promise<string> => {
+  const groq = getGroqClient();
 
   try {
-    let completion;
-    let resolvedModel = OPENROUTER_MODEL;
+    const completion = await groq.chat.completions.create({
+      model: GROQ_MODEL,
+      messages,
+      max_tokens: maxTokens,
+      temperature: 0.7,
+    });
 
-    const guardrailErrorMessage =
-      "OpenRouter has no available endpoints for the current privacy/data policy. Update settings at https://openrouter.ai/settings/privacy or set VITE_OPENROUTER_FALLBACK_MODEL to a model that has available endpoints.";
-
-    try {
-      completion = await sendChat(OPENROUTER_MODEL, false);
-    } catch (primaryError) {
-      if (!isGuardrailError(primaryError)) {
-        throw primaryError;
-      }
-
-      try {
-        completion = await sendChat(OPENROUTER_MODEL, true);
-      } catch (overrideError) {
-        if (!isGuardrailError(overrideError)) {
-          throw overrideError;
-        }
-
-        if (OPENROUTER_FALLBACK_MODEL === OPENROUTER_MODEL) {
-          throw new Error(guardrailErrorMessage);
-        }
-
-        completion = await sendChat(OPENROUTER_FALLBACK_MODEL, true);
-        resolvedModel = OPENROUTER_FALLBACK_MODEL;
-        console.warn(
-          `OpenRouter guardrail restrictions blocked ${OPENROUTER_MODEL}; using fallback model ${OPENROUTER_FALLBACK_MODEL}.`
-        );
-      }
+    const text = completion.choices[0]?.message?.content;
+    if (!text?.trim()) {
+      throw new Error("No content returned from Groq API");
     }
 
-    const message = completion?.choices?.[0]?.message;
-    if (!message) {
-      console.error("Unexpected API response structure:", completion);
-      throw new Error("Invalid response structure from OpenRouter API");
-    }
-
-    const resolvedContent = getMessageOutput(message);
-
-    if (!resolvedContent.trim()) {
-      throw new Error(`No content returned from OpenRouter API (model: ${resolvedModel})`);
-    }
-
-    return resolvedContent.trim();
+    return text.trim();
   } catch (error) {
-    const errorMessage = error instanceof Error ? error.message : String(error);
-    if (errorMessage.includes(OPENROUTER_GUARDRAIL_ERROR_SNIPPET)) {
-      throw new Error(
-        "No OpenRouter endpoints are available under your current privacy/data policy. Update https://openrouter.ai/settings/privacy or use a different model/provider policy."
-      );
-    }
-
-    console.error("OpenRouter API call failed:", error);
+    console.error("Groq API call failed:", error);
     throw error;
   }
 };
 
-export const createOpenRouterAgent = (
+// Backward-compat aliases — nothing else in the codebase needs to change
+export const callGeminiLLM = callGroqLLM;
+export const callOpenRouterLLM = callGroqLLM;
+
+interface AgentMessage {
+  role: "user" | "assistant" | "system";
+  content: string;
+}
+
+interface LLMAgent {
+  send: (message: string, maxTokens?: number) => Promise<string>;
+  getHistory: () => AgentMessage[];
+  clearHistory: () => void;
+}
+
+export const createGroqAgent = (
   systemPrompt = "You are a helpful assistant for B2B sales outreach."
-): OpenRouterAgent => {
-  const history: OpenRouterMessage[] = [{
-    role: "system",
-    content: systemPrompt,
-  }];
+): LLMAgent => {
+  const history: AgentMessage[] = [
+    { role: "system", content: systemPrompt },
+  ];
 
   return {
     send: async (message: string, maxTokens = 4000) => {
       history.push({ role: "user", content: message });
-
       try {
-        const assistantReply = await callOpenRouterLLM(history, maxTokens);
-        history.push({ role: "assistant", content: assistantReply });
-        return assistantReply;
+        const reply = await callGroqLLM(history, maxTokens);
+        history.push({ role: "assistant", content: reply });
+        return reply;
       } catch (error) {
         history.pop();
         throw error;
@@ -244,13 +128,17 @@ export const createOpenRouterAgent = (
     },
     getHistory: () => [...history],
     clearHistory: () => {
-      history.splice(0, history.length, {
-        role: "system",
-        content: systemPrompt,
-      });
+      history.splice(0, history.length, { role: "system", content: systemPrompt });
     },
   };
 };
+
+// Backward-compat aliases
+export const createGeminiAgent = createGroqAgent;
+export const createOpenRouterAgent = createGroqAgent;
+
+
+
 
 // ============= EMAIL PERSONALIZATION =============
 export interface PersonalizedEmail {
