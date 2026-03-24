@@ -225,6 +225,7 @@ Requirements:
 - Include variations of job titles
 - Target companies by industry type
 - Include location if specified
+-include linkedin search queries
 
 Return ONLY a JSON array of 5 strings (search queries), no other text:
 ["query1", "query2", "query3", "query4", "query5"]`;
